@@ -6,9 +6,9 @@ use scryer_domain::{
     Title,
     title_normalization::{release_romanization_keys, romanization_key},
     title_spelling::{
-        SpellingEquivalence, TitleScript,
-        compare_title_spelling_for_resolution as compare_title_spelling, title_script,
-        title_spelling_key, title_spelling_profiles,
+        SpellingEquivalence, TITLE_FOLD_EQUIVALENCE, TitleScript,
+        compare_title_spelling_for_resolution as compare_title_spelling, title_equivalence_fold,
+        title_script, title_spelling_key, title_spelling_profiles,
     },
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -682,12 +682,40 @@ pub(crate) fn anchor_reaches_collision_check(
     })
 }
 
+/// Whether a release's spelling and a catalog name differ only in the ways
+/// [`title_equivalence_fold`] folds away: apostrophes, dotted initialisms,
+/// `&` against `and`, a dropped mid-title stopword, a Roman numeral against
+/// its digits.
+///
+/// Literally equal keys never reach the fold; they are exact already. The
+/// first letter has to agree before either side is folded, which is what the
+/// fold guarantees (it never drops, joins away or rewrites the first word),
+/// and keeps the per-pair cost to one comparison for the many names of a
+/// bucket that begin differently.
+///
+/// Only Latin names fold. The fold is a rule about words separated by spaces;
+/// it says nothing about CJK or Cyrillic spellings.
+fn folds_to_same_title(observed: &str, observed_raw: &str, name: &SpellingName) -> bool {
+    if observed == name.text
+        || observed.chars().next() != name.text.chars().next()
+        || title_script(observed) != TitleScript::Latin
+        || title_script(&name.text) != TitleScript::Latin
+    {
+        return false;
+    }
+    let folded = title_equivalence_fold(observed_raw);
+    !folded.is_empty() && folded == title_equivalence_fold(&name.raw)
+}
+
 fn spelling_distance(
     observed: &str,
     observed_raw: &str,
     name: &SpellingName,
     rival_bound: Option<usize>,
 ) -> Option<(usize, Option<&'static str>)> {
+    if folds_to_same_title(observed, observed_raw, name) {
+        return Some((0, Some(TITLE_FOLD_EQUIVALENCE)));
+    }
     if numbers(observed_raw) != numbers(&name.raw) {
         return None;
     }

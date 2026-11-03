@@ -333,6 +333,121 @@ fn collapse_initialisms(raw: &str) -> String {
     collapsed.join(" ")
 }
 
+/// Reported as the locale of a match that holds only after
+/// [`title_equivalence_fold`].
+pub const TITLE_FOLD_EQUIVALENCE: &str = "title-fold";
+
+/// Words [`title_equivalence_fold`] drops from the middle of a name.
+const FOLD_STOPWORDS: &[&str] = &["a", "an", "and", "of", "or", "the"];
+
+/// The value of a Roman numeral from I to XX, which is as far as a title ever
+/// counts. Larger numerals are words more often than numbers (`MIX`, `CIVIL`).
+fn small_roman_value(lowered: &str) -> Option<u32> {
+    const NUMERALS: [&str; 20] = [
+        "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii", "xiii", "xiv",
+        "xv", "xvi", "xvii", "xviii", "xix", "xx",
+    ];
+    NUMERALS
+        .iter()
+        .position(|numeral| *numeral == lowered)
+        .map(|position| position as u32 + 1)
+}
+
+/// The spellings scene and catalog names disagree on without disagreeing about
+/// the title, folded to one comparable form. Two names are *equivalent* when
+/// their folds are equal; the fold is never stored and never used as a lookup
+/// key, because it deliberately conflates spellings that
+/// [`title_lookup_form`] keeps apart.
+///
+/// What it folds, each one a rule Sonarr and Radarr arrived at over the years:
+///
+/// * apostrophes join the word they sit in (`Schindler's` -> `schindlers`,
+///   `I'm` -> `im`), where the lookup form splits the word in two;
+/// * runs of single letters join (`P.D.` -> `pd`, `S.H.I.E.L.D.` ->
+///   `shield`), so a dotted initialism equals its undotted spelling;
+/// * `&` reads as `and`, and `and`, `or`, `of`, `the`, `a`, `an` are dropped
+///   from the *middle* of a name. The first and last word are never dropped,
+///   so `The Series` stays different from `Series`;
+/// * a Roman numeral from II to XX reads as its digits (`Rocky II` equals
+///   `Rocky 2`), under the same rule [`title_numbers`] uses to recognise one
+///   (upper case, or a counting word before it), and never as the first word
+///   (`I Am Legend`, `V for Vendetta`). `Rocky II` and `Rocky III` stay apart.
+///
+/// Accents are left alone: accent omission is a separate, guarded equivalence.
+/// **Pass the name as written**, for the reason [`title_numbers`] gives. An
+/// empty result means there is nothing to compare.
+pub fn title_equivalence_fold(value: &str) -> String {
+    let mut widened = String::with_capacity(value.len() + 8);
+    for ch in value.nfkc() {
+        match ch {
+            '\'' | '`' | '\u{00b4}' | '\u{2018}' | '\u{2019}' | '\u{02bc}' => {}
+            '&' => widened.push_str(" and "),
+            _ if ch.is_alphanumeric() || is_combining_mark(ch) => widened.push(ch),
+            _ => widened.push(' '),
+        }
+    }
+    // Runs of single letters join first, in the case they were written in, so
+    // the `I` of `S.H.I.E.L.D.` is never mistaken for a numeral below.
+    let words = widened.split_whitespace().collect::<Vec<_>>();
+    let is_initial = |token: &str| {
+        let mut chars = token.chars();
+        chars.next().is_some_and(char::is_alphabetic) && chars.next().is_none()
+    };
+    let mut written = Vec::<String>::with_capacity(words.len());
+    let mut index = 0usize;
+    while index < words.len() {
+        let start = index;
+        while index < words.len() && is_initial(words[index]) {
+            index += 1;
+        }
+        match index - start {
+            0 => {
+                written.push(words[index].to_string());
+                index += 1;
+            }
+            1 => written.push(words[start].to_string()),
+            _ => written.push(words[start..index].concat()),
+        }
+    }
+
+    let mut joined = Vec::<String>::with_capacity(written.len());
+    for (position, token) in written.iter().enumerate() {
+        let lowered = token.to_lowercase();
+        let numeral = (position > 0)
+            .then(|| small_roman_value(&lowered))
+            .flatten()
+            .filter(|_| {
+                let shouted = token
+                    .chars()
+                    .all(|ch| !ch.is_alphabetic() || ch.is_uppercase());
+                let repeated_letter = lowered
+                    .chars()
+                    .next()
+                    .is_some_and(|first| matches!(first, 'i' | 'v' | 'x'))
+                    && lowered.chars().all(|ch| lowered.starts_with(ch));
+                let after_context = NUMERAL_CONTEXT_WORDS
+                    .iter()
+                    .any(|marker| written[position - 1].eq_ignore_ascii_case(marker));
+                shouted || (repeated_letter && after_context)
+            });
+        joined.push(match numeral {
+            Some(value) => value.to_string(),
+            None => lowered,
+        });
+    }
+
+    let last = joined.len().saturating_sub(1);
+    joined
+        .iter()
+        .enumerate()
+        .filter(|(position, token)| {
+            *position == 0 || *position == last || !FOLD_STOPWORDS.contains(&token.as_str())
+        })
+        .map(|(_, token)| token.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Words that introduce a lower-case Roman numeral in a title.
 const NUMERAL_CONTEXT_WORDS: &[&str] = &["part", "season", "chapter", "vol"];
 
@@ -790,6 +905,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn equivalence_fold_joins_apostrophes_and_initialisms() {
+        for (left, right) in [
+            ("Schindler's List", "Schindlers List"),
+            ("Schindler\u{2019}s List", "Schindlers List"),
+            ("I'm a Cyborg, But That's OK", "Im a Cyborg But Thats OK"),
+            ("Chicago P.D.", "Chicago PD"),
+            (
+                "Marvel's Agents of S.H.I.E.L.D.",
+                "Marvels Agents of SHIELD",
+            ),
+        ] {
+            assert_eq!(
+                title_equivalence_fold(left),
+                title_equivalence_fold(right),
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn equivalence_fold_reads_ampersand_as_and_and_drops_middle_stopwords() {
+        for (left, right) in [
+            ("Tom & Jerry", "Tom and Jerry"),
+            ("Tom & Jerry", "Tom Jerry"),
+            ("Law & Order", "Law.Order"),
+            ("Pride and Prejudice", "Pride Prejudice"),
+            ("Word of the Word", "Word Word"),
+        ] {
+            assert_eq!(
+                title_equivalence_fold(left),
+                title_equivalence_fold(right),
+                "{left} vs {right}"
+            );
+        }
+        // The first and last word are never dropped.
+        for (left, right) in [
+            ("The Series", "Series"),
+            ("Word Word The", "Word Word"),
+            ("A Quiet Place", "Quiet Place"),
+            ("Tom & Jerry Kids", "Tom Jerry"),
+        ] {
+            assert_ne!(
+                title_equivalence_fold(left),
+                title_equivalence_fold(right),
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn equivalence_fold_reads_roman_numerals_but_keeps_them_apart() {
+        assert_eq!(
+            title_equivalence_fold("Rocky II"),
+            title_equivalence_fold("Rocky 2")
+        );
+        assert_eq!(
+            title_equivalence_fold("Rocky II"),
+            title_equivalence_fold("Rocky.II")
+        );
+        assert_eq!(
+            title_equivalence_fold("Volume IV"),
+            title_equivalence_fold("Volume 4")
+        );
+        assert_eq!(
+            title_equivalence_fold("Part ii"),
+            title_equivalence_fold("Part 2")
+        );
+        for (left, right) in [
+            ("Rocky II", "Rocky III"),
+            ("Rocky II", "Rocky I"),
+            ("Nymphomaniac Volume I", "Nymphomaniac Volume II"),
+            ("Rocky II", "Rocky 3"),
+        ] {
+            assert_ne!(
+                title_equivalence_fold(left),
+                title_equivalence_fold(right),
+                "{left} vs {right}"
+            );
+        }
+        // Words that happen to be valid numerals stay words, and a leading
+        // letter is not a numeral.
+        assert_eq!(title_equivalence_fold("Mix Tape"), "mix tape");
+        assert_eq!(title_equivalence_fold("Civil War"), "civil war");
+        assert_eq!(title_equivalence_fold("I Am Legend"), "i am legend");
+        assert_eq!(title_equivalence_fold("X Men"), "x men");
+        assert_eq!(title_equivalence_fold("MIX TAPE"), "mix tape");
+    }
+
+    #[test]
+    fn equivalence_fold_leaves_accents_to_their_own_guarded_equivalence() {
+        assert_ne!(
+            title_equivalence_fold("Amélie"),
+            title_equivalence_fold("Amelie")
+        );
+        assert_eq!(title_equivalence_fold("   "), "");
     }
 
     #[test]
