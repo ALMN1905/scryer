@@ -7513,4 +7513,6 @@ mod tests {
             ));
         }
     }
+
+    mod arr_parity_corpus;
 }
