@@ -7516,4 +7516,5 @@ mod tests {
 
     mod arr_parity_corpus;
     mod title_fold_matching;
+    mod arr_parity_fixture_rows;
 }
